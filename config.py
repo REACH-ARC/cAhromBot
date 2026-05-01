@@ -63,6 +63,7 @@ def _bool(name: str, default: bool) -> bool:
 
 
 ANTHROPIC_API_KEY: str = _require("ANTHROPIC_API_KEY")
+TWELVE_DATA_API_KEY: str = _require("TWELVE_DATA_API_KEY")
 TELEGRAM_BOT_TOKEN: str = _require("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID: str = _require("TELEGRAM_CHAT_ID")
 
