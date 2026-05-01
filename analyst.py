@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+import time
 from typing import Optional
 
 from anthropic import Anthropic
@@ -22,6 +23,8 @@ logger = logging.getLogger(__name__)
 
 _MODEL = "claude-opus-4-5"
 _MAX_TOKENS = 600
+_RETRY_ATTEMPTS = 3
+_RETRY_BACKOFF_SECONDS = (2, 5, 10)
 
 _SYSTEM_PROMPT = (
     "You are a professional XAUUSD (gold/USD) technical analyst. "
@@ -104,8 +107,12 @@ def _build_user_prompt(
         "ADX > 25 = trending (trend-continuation preferred). Treat "
         "EMA-aligned trends as suspect when ADX is weak.\n"
         "- Use WAIT when timeframes disagree or signals are weak.\n"
-        "- Stop loss must respect ATR; take profit should target at "
-        "least 1.5R unless context says otherwise.\n"
+        "- Stop loss must respect ATR (typically 1.5-2x ATR beyond "
+        "structure). Take profit MUST yield reward:risk >= 2.0 — "
+        "compute (TP-entry)/(entry-SL) for BUY or (entry-TP)/(SL-entry) "
+        "for SELL before responding. If the nearest realistic TP target "
+        "given recent structure cannot reach 2R, return WAIT rather "
+        "than a sub-2R BUY/SELL; do not stretch TP to fake the ratio.\n"
         "- No text outside the JSON object."
     )
 
@@ -159,15 +166,28 @@ def analyze(
     """
     user_prompt = _build_user_prompt(context_m15, context_h1, context_d1, dxy_context)
 
-    try:
-        message = _client.messages.create(
-            model=_MODEL,
-            max_tokens=_MAX_TOKENS,
-            system=_SYSTEM_PROMPT,
-            messages=[{"role": "user", "content": user_prompt}],
-        )
-    except Exception as exc:  # noqa: BLE001 - any SDK/network error
-        logger.error("Anthropic API call failed: %s", exc)
+    message = None
+    last_exc: Optional[Exception] = None
+    for attempt in range(_RETRY_ATTEMPTS):
+        try:
+            message = _client.messages.create(
+                model=_MODEL,
+                max_tokens=_MAX_TOKENS,
+                system=_SYSTEM_PROMPT,
+                messages=[{"role": "user", "content": user_prompt}],
+            )
+            break
+        except Exception as exc:  # noqa: BLE001 - any SDK/network error
+            last_exc = exc
+            logger.warning(
+                "Anthropic attempt %d/%d failed: %s",
+                attempt + 1, _RETRY_ATTEMPTS, exc,
+            )
+            if attempt < _RETRY_ATTEMPTS - 1:
+                time.sleep(_RETRY_BACKOFF_SECONDS[attempt])
+
+    if message is None:
+        logger.error("Anthropic API call exhausted retries: %s", last_exc)
         return None
 
     try:

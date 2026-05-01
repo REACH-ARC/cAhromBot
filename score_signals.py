@@ -292,31 +292,49 @@ def _summarize(outcomes: List[dict]) -> str:
     return "\n".join(lines)
 
 
-def main() -> int:
-    """Entry point: load signals, fetch candles, score, write outcomes."""
-    logging.basicConfig(level=logging.INFO,
-                        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
+def score_records(
+    symbol: str,
+    since: Optional[datetime] = None,
+    write_outcomes_file: bool = True,
+) -> List[dict]:
+    """Load, score, and optionally persist signal outcomes.
 
-    from config import SYMBOL
+    Args:
+        symbol: Symbol such as "XAU/USD".
+        since: Optional UTC cutoff; only signals at or after this time
+            are scored. None means "all records in signals.log".
+        write_outcomes_file: When True, replaces ``signal_outcomes.log``
+            with the freshly scored outcomes.
 
+    Returns:
+        List of outcome dicts (one per BUY/SELL record), as produced by
+        ``_score_one``. Empty if scoring is impossible.
+    """
     records = _load_signal_records()
+    if since is not None:
+        filtered = []
+        for r in records:
+            try:
+                ts = datetime.fromisoformat(r["ts"])
+            except (KeyError, ValueError):
+                continue
+            if ts >= since:
+                filtered.append(r)
+        records = filtered
+
     if not records:
-        logger.error("No signal records found; nothing to score")
-        return 1
+        logger.warning("score_records: no records to score for %s", symbol)
+        return []
 
     earliest = _earliest_signal_ts(records)
     if earliest is None:
-        logger.error("Could not determine earliest signal timestamp")
-        return 1
+        logger.warning("score_records: could not determine earliest timestamp")
+        return []
 
-    logger.info("Loaded %d signal records; earliest=%s", len(records), earliest)
-    logger.info("Fetching M15 history for %s", SYMBOL)
-    candles = _fetch_m15_history(SYMBOL, earliest)
+    candles = _fetch_m15_history(symbol, earliest)
     if candles is None:
-        logger.error("M15 history fetch failed; cannot score")
-        return 1
-    logger.info("Fetched %d M15 candles (%s -> %s)",
-                len(candles), candles.index[0], candles.index[-1])
+        logger.warning("score_records: M15 history fetch failed")
+        return []
 
     outcomes: List[dict] = []
     for r in records:
@@ -324,11 +342,63 @@ def main() -> int:
         if scored is not None:
             outcomes.append(scored)
 
-    with _OUTCOMES_PATH.open("w", encoding="utf-8") as fh:
-        for o in outcomes:
-            fh.write(json.dumps(o) + "\n")
-    logger.info("Wrote %d outcomes to %s", len(outcomes), _OUTCOMES_PATH)
+    if write_outcomes_file:
+        try:
+            with _OUTCOMES_PATH.open("w", encoding="utf-8") as fh:
+                for o in outcomes:
+                    fh.write(json.dumps(o) + "\n")
+        except OSError as exc:
+            logger.error("Failed to write %s: %s", _OUTCOMES_PATH, exc)
 
+    return outcomes
+
+
+def load_recent_outcomes(days: int) -> List[dict]:
+    """Read ``signal_outcomes.log`` and filter to the last ``days`` days.
+
+    Used by weekly_report when an external scorer ran already and we
+    just want to render its results without re-fetching candles.
+
+    Args:
+        days: Window size in days, anchored to "now" (UTC).
+
+    Returns:
+        List of outcome dicts. Empty if the file is missing or unreadable.
+    """
+    if not _OUTCOMES_PATH.exists():
+        return []
+    cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+    out: List[dict] = []
+    try:
+        with _OUTCOMES_PATH.open("r", encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                    ts = datetime.fromisoformat(rec["signal_ts"])
+                except (json.JSONDecodeError, KeyError, ValueError):
+                    continue
+                if ts >= cutoff:
+                    out.append(rec)
+    except OSError as exc:
+        logger.error("Failed to read %s: %s", _OUTCOMES_PATH, exc)
+    return out
+
+
+def main() -> int:
+    """Entry point: load signals, fetch candles, score, write outcomes."""
+    logging.basicConfig(level=logging.INFO,
+                        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
+
+    from config import SYMBOL
+
+    outcomes = score_records(SYMBOL)
+    if not outcomes:
+        return 1
+
+    logger.info("Wrote %d outcomes to %s", len(outcomes), _OUTCOMES_PATH)
     print()
     print(_summarize(outcomes))
     return 0

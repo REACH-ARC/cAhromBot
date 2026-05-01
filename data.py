@@ -14,12 +14,16 @@ maps to ``DX-Y.NYB`` (the dollar index) with futures fallback.
 from __future__ import annotations
 
 import logging
+import time
 from typing import Optional
 
 import pandas as pd
 import yfinance as yf
 
 logger = logging.getLogger(__name__)
+
+_RETRY_ATTEMPTS = 3
+_RETRY_BACKOFF_SECONDS = (2, 5, 10)  # delay before attempt 2, 3, then no-op
 
 _SYMBOL_ALIASES = {
     "XAU/USD": ["GC=F", "XAUUSD=X"],
@@ -61,23 +65,46 @@ class MarketDataClient:
         del api_key  # yfinance needs no auth
 
     def _fetch(self, ticker: str, interval: str, period: str) -> Optional[pd.DataFrame]:
-        """Single-shot Yahoo download with logging on failure."""
-        try:
-            df = yf.download(
-                ticker,
-                period=period,
-                interval=interval,
-                progress=False,
-                auto_adjust=False,
-                threads=False,
-            )
-        except Exception as exc:  # noqa: BLE001 - any network/parse error
-            logger.error("yfinance download failed for %s %s: %s", ticker, interval, exc)
-            return None
+        """Yahoo download with bounded retry + exponential backoff.
 
-        if df is None or df.empty:
-            return None
-        return _flatten(df)
+        Retries on any exception or empty payload, since yfinance
+        commonly emits transient 429/5xx errors and silent empties.
+        """
+        last_exc: Optional[Exception] = None
+        for attempt in range(_RETRY_ATTEMPTS):
+            try:
+                df = yf.download(
+                    ticker,
+                    period=period,
+                    interval=interval,
+                    progress=False,
+                    auto_adjust=False,
+                    threads=False,
+                )
+            except Exception as exc:  # noqa: BLE001 - any network/parse error
+                last_exc = exc
+                df = None
+                logger.warning(
+                    "yfinance attempt %d/%d failed for %s %s: %s",
+                    attempt + 1, _RETRY_ATTEMPTS, ticker, interval, exc,
+                )
+            else:
+                if df is not None and not df.empty:
+                    return _flatten(df)
+                logger.warning(
+                    "yfinance attempt %d/%d returned empty for %s %s",
+                    attempt + 1, _RETRY_ATTEMPTS, ticker, interval,
+                )
+
+            if attempt < _RETRY_ATTEMPTS - 1:
+                time.sleep(_RETRY_BACKOFF_SECONDS[attempt])
+
+        if last_exc is not None:
+            logger.error(
+                "yfinance download exhausted retries for %s %s: %s",
+                ticker, interval, last_exc,
+            )
+        return None
 
     def get_candles(
         self,
@@ -147,9 +174,11 @@ class MarketDataClient:
             Dict with keys ``"M15"``, ``"H1"``, ``"D1"`` mapping to
             DataFrames, or ``None`` if any fetch fails.
         """
+        # D1 needs >=200 bars so EMA-200 can be computed; 260 gives a
+        # year of trading days plus headroom for warm-up.
         m15 = self.get_candles(symbol, "15min", outputsize=200)
-        h1 = self.get_candles(symbol, "1h", outputsize=200)
-        d1 = self.get_candles(symbol, "1day", outputsize=120)
+        h1 = self.get_candles(symbol, "1h", outputsize=250)
+        d1 = self.get_candles(symbol, "1day", outputsize=260)
 
         if m15 is None or h1 is None or d1 is None:
             logger.error(
@@ -167,8 +196,8 @@ class MarketDataClient:
             ``None`` if DXY is unavailable. Caller should continue
             without DXY context in that case.
         """
-        h1 = self.get_candles("DXY", "1h", outputsize=200)
-        d1 = self.get_candles("DXY", "1day", outputsize=120)
+        h1 = self.get_candles("DXY", "1h", outputsize=250)
+        d1 = self.get_candles("DXY", "1day", outputsize=260)
         if h1 is None or d1 is None:
             logger.warning("DXY context unavailable; continuing without it")
             return None

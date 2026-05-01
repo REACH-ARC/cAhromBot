@@ -19,6 +19,10 @@ import pandas_ta as ta
 logger = logging.getLogger(__name__)
 
 
+_ATR_MAX_FRAC_OF_PRICE = 0.05  # ATR > 5% of price ⇒ corrupt data, reject cycle.
+_RECENT_LOOKBACK = 20
+
+
 def _safe_round(value: object, ndigits: int = 2) -> Optional[float]:
     """Round a numeric value, returning None for NaN/missing input.
 
@@ -104,9 +108,45 @@ def compute_indicators(df: pd.DataFrame) -> dict:
     else:
         trend_strength = "weak"
 
-    recent = work.tail(20)
-    recent_high = _safe_round(recent["high"].max() if not recent.empty else None, 2)
-    recent_low = _safe_round(recent["low"].min() if not recent.empty else None, 2)
+    # Reject cycles where ATR is implausibly large vs. price — almost
+    # always a yfinance payload glitch (sparse/spliced bars). Better to
+    # skip than feed corrupt context to the analyst.
+    if (
+        last_atr is not None
+        and last_close is not None
+        and last_close > 0
+        and last_atr > last_close * _ATR_MAX_FRAC_OF_PRICE
+    ):
+        logger.error(
+            "Suspect ATR=%.2f vs close=%.2f (>%.0f%%); skipping cycle",
+            last_atr, last_close, _ATR_MAX_FRAC_OF_PRICE * 100,
+        )
+        return {}
+
+    recent = work.tail(_RECENT_LOOKBACK)
+    if (
+        recent.empty
+        or len(recent) < _RECENT_LOOKBACK
+        or recent["high"].isna().all()
+        or recent["low"].isna().all()
+    ):
+        logger.warning(
+            "Recent %d-bar slice incomplete (rows=%d); recent_high/low set to None",
+            _RECENT_LOOKBACK, len(recent),
+        )
+        recent_high = None
+        recent_low = None
+    else:
+        recent_high = _safe_round(recent["high"].max(), 2)
+        recent_low = _safe_round(recent["low"].min(), 2)
+        # Guard against a min/max of exactly 0 (or NaN passing _safe_round)
+        # which historically appeared in logs after sparse fetches.
+        if recent_low is not None and recent_low <= 0:
+            logger.warning("Recent low computed as <=0 (%.2f); coercing to None", recent_low)
+            recent_low = None
+        if recent_high is not None and recent_high <= 0:
+            logger.warning("Recent high computed as <=0 (%.2f); coercing to None", recent_high)
+            recent_high = None
 
     if last_close is None or last_ema200 is None:
         price_position: Optional[str] = None

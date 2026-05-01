@@ -1,22 +1,28 @@
 # xaubot
 
-An AI-powered XAUUSD (gold/USD) signal bot. It fetches live candle data
-from Twelve Data, computes technical indicators (RSI, EMA, MACD, ATR)
-on the 15-minute and 1-hour timeframes, asks Claude to act as a
-disciplined analyst and produce a structured BUY/SELL/WAIT signal, runs
+An AI-powered XAUUSD (gold/USD) **signal** bot. It fetches live candle
+data from Yahoo Finance (via `yfinance`), computes technical indicators
+(RSI, EMA, MACD, ATR, ADX) on M15 / H1 / D1 timeframes plus a DXY
+cross-asset context, asks Claude to act as a disciplined analyst and
+produce a structured BUY/SELL/WAIT signal, runs
 session/confidence/duplicate filters over the result, and pushes
 approved signals to a Telegram chat. APScheduler drives the cycle every
 15 minutes and the process is designed to run 24/7 as a systemd service
 on an Oracle Cloud Free Tier Ubuntu 22.04 ARM VM.
 
+> **This bot does NOT place trades.** It is a notify-only signal
+> generator: every "delivery" is a Telegram message. There is no broker
+> integration, no order placement, no position tracking. Use the
+> signals manually or wire your own broker bridge on top.
+
 ## Prerequisites
 
 - Ubuntu 22.04 (ARM or x86_64) with Python 3.11
-- A Twelve Data API key (free tier is fine for 15-min cadence)
 - An Anthropic API key with access to `claude-opus-4-5`
 - A Telegram bot token (from @BotFather) and a chat ID to receive signals
 - `git`, `python3-venv`, and `python3-pip` installed:
   `sudo apt update && sudo apt install -y python3.11 python3.11-venv python3-pip git`
+- Yahoo Finance via `yfinance` is unauthenticated; no API key required.
 
 ## Setup
 
@@ -138,16 +144,36 @@ journalctl -u xaubot -f          # live tail of stdout/stderr
 tail -f ~/xaubot/xaubot.log      # rotating file log
 ```
 
+## Tuning knobs (env vars)
+
+All optional; sensible defaults shown.
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `CONFIDENCE_MIN` | `65` | Min Claude confidence to deliver a signal. |
+| `COOLDOWN_MINUTES` | `30` | Min gap between same-direction deliveries. |
+| `DUP_CONFIDENCE_BUMP` | `10` | Confidence rise (in pts) that bypasses cooldown — lets a strengthening setup re-fire even inside the window. |
+| `SESSION_FILTER_ENABLED` | `true` | Set to `false` to allow signals 24/5 (Asian session included). |
+| `MIN_RR` | `2.0` | Minimum reward:risk ratio. Setups below this are rejected. At 40% hit rate, 2.0 is breakeven; at 50%, 1.5 is. Set to `0` to disable. |
+| `CHOP_ADX_THRESHOLD` | `20` | When both D1 and H1 ADX are below this, the cycle is skipped before calling Claude (regime pre-filter). Set to `0` to disable. |
+| `SYMBOL` | `XAU/USD` | Primary instrument. |
+
+Audit `signals.log` weekly and adjust `CONFIDENCE_MIN` based on the
+calibration block at the bottom of the weekly report.
+
 ## Troubleshooting
 
 - **`FATAL: required environment variable '...' is missing`** — you
   forgot to copy `.env.example` to `.env` or left a key blank.
-- **Twelve Data 429 rate limit** — free tier allows 8 req/min; the bot
-  paces itself but if you run it concurrently with other tools the
-  cycle will be skipped. Wait a minute and check the next run.
+- **`yfinance` empty payload / 429** — Yahoo occasionally rate-limits
+  or returns sparse data. The fetcher retries 3× with exponential
+  backoff; persistent failures skip the cycle (see `xaubot.log`).
 - **`Anthropic API call failed`** — check that the API key is valid and
   the account has access to `claude-opus-4-5`. Network issues on the
-  VM also surface here.
+  VM also surface here. The call retries 3× before giving up.
+- **`Suspect ATR=… vs close=…; skipping cycle`** — indicator validator
+  rejected a corrupt yfinance payload. Self-healing; next cycle should
+  be fine. If persistent, inspect M15/H1/D1 fetches.
 - **No Telegram messages arriving** — confirm the chat ID by sending a
   message to your bot and visiting
   `https://api.telegram.org/bot<TOKEN>/getUpdates`. The chat ID may be

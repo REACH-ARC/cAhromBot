@@ -12,12 +12,42 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from datetime import datetime, timezone
 from typing import Optional
 
 logger = logging.getLogger(__name__)
 
 _LOG_PATH = "signals.log"
+_MAX_BYTES = 10_000_000  # 10 MB
+_BACKUP_COUNT = 4
+
+
+def _rotate_if_needed(path: str) -> None:
+    """Rotate the JSONL log if it exceeds ``_MAX_BYTES``.
+
+    Mirrors stdlib RotatingFileHandler semantics: shifts ``log -> log.1``,
+    ``log.1 -> log.2`` etc. up to ``_BACKUP_COUNT``; the oldest is
+    deleted. Failures are swallowed so logging never crashes the loop.
+    """
+    try:
+        if not os.path.exists(path) or os.path.getsize(path) < _MAX_BYTES:
+            return
+    except OSError:
+        return
+
+    try:
+        oldest = f"{path}.{_BACKUP_COUNT}"
+        if os.path.exists(oldest):
+            os.remove(oldest)
+        for i in range(_BACKUP_COUNT - 1, 0, -1):
+            src = f"{path}.{i}"
+            dst = f"{path}.{i + 1}"
+            if os.path.exists(src):
+                os.replace(src, dst)
+        os.replace(path, f"{path}.1")
+    except OSError as exc:
+        logger.error("signals.log rotation failed: %s", exc)
 
 
 def log_signal(
@@ -64,6 +94,7 @@ def log_signal(
         "dxy": dxy_context,
     }
     try:
+        _rotate_if_needed(_LOG_PATH)
         with open(_LOG_PATH, "a", encoding="utf-8") as fh:
             fh.write(json.dumps(record) + "\n")
     except Exception as exc:  # noqa: BLE001 - logging must never crash the loop

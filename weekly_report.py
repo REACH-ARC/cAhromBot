@@ -61,11 +61,62 @@ def _bucket(confidence: int) -> str:
     return f"{low}-{low + 9}"
 
 
-def _format_report(records: List[dict]) -> str:
+def _calibration_lines(outcomes: List[dict]) -> List[str]:
+    """Build the calibration block for the weekly report.
+
+    Bins delivered (or all resolved) outcomes by confidence decile and
+    shows TP / SL counts plus hit rate. This is the single most useful
+    piece of feedback for tuning ``CONFIDENCE_MIN`` — if the 60-69
+    bucket hits 45% and the 70-79 bucket hits 70%, the user knows the
+    threshold is well-placed.
+
+    Args:
+        outcomes: Outcome dicts from ``score_records``/``load_recent_outcomes``.
+
+    Returns:
+        Lines (each one a row) ready to be joined into the report. Empty
+        list when there is nothing to report.
+    """
+    resolvable = [
+        o for o in outcomes
+        if o.get("outcome") in ("TP_hit", "SL_hit") and isinstance(o.get("confidence"), int)
+    ]
+    if not resolvable:
+        return []
+
+    bucket_counts: dict = {}
+    for o in resolvable:
+        b = _bucket(o["confidence"])
+        bucket_counts.setdefault(b, Counter())
+        bucket_counts[b][o["outcome"]] += 1
+
+    lines = ["", "<b>Calibration (TP / SL / hit rate)</b>"]
+    overall_tp = 0
+    overall_sl = 0
+    for b in sorted(bucket_counts.keys()):
+        c = bucket_counts[b]
+        tp = c["TP_hit"]
+        sl = c["SL_hit"]
+        overall_tp += tp
+        overall_sl += sl
+        total = tp + sl
+        rate = f"{tp / total:.0%}" if total else "n/a"
+        lines.append(f"  {b}: TP={tp}  SL={sl}  hit_rate={rate}")
+    overall_total = overall_tp + overall_sl
+    if overall_total:
+        lines.append(
+            f"  overall: TP={overall_tp}  SL={overall_sl}  "
+            f"hit_rate={overall_tp / overall_total:.0%}"
+        )
+    return lines
+
+
+def _format_report(records: List[dict], outcomes: List[dict]) -> str:
     """Render the records as a Telegram-friendly summary string.
 
     Args:
         records: List of signal records from ``_load_recent``.
+        outcomes: List of scored outcome dicts (may be empty).
     """
     if not records:
         return (
@@ -95,7 +146,40 @@ def _format_report(records: List[dict]) -> str:
         "<b>Filter outcomes</b>",
         *(f"  {reason}: {count}" for reason, count in by_filter.most_common()),
     ]
+    lines.extend(_calibration_lines(outcomes))
     return "\n".join(lines)
+
+
+def _gather_outcomes(days: int) -> List[dict]:
+    """Score recent records, falling back to a pre-computed file.
+
+    Tries to call the scorer inline so the report always has fresh
+    calibration data. If the scorer fails (no network, rate limit), it
+    falls back to the most recent ``signal_outcomes.log`` content.
+
+    Args:
+        days: Window size in days, anchored to "now" (UTC).
+
+    Returns:
+        List of outcome dicts, possibly empty.
+    """
+    cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+    try:
+        from score_signals import load_recent_outcomes, score_records
+
+        from config import SYMBOL
+    except ImportError as exc:  # pragma: no cover - import-time only
+        logger.error("Could not import scorer: %s", exc)
+        return []
+
+    try:
+        outcomes = score_records(SYMBOL, since=cutoff, write_outcomes_file=True)
+        if outcomes:
+            return outcomes
+    except Exception as exc:  # noqa: BLE001 - scoring is best-effort
+        logger.warning("Inline scoring failed (%s); falling back to file", exc)
+
+    return load_recent_outcomes(days)
 
 
 def main() -> int:
@@ -105,7 +189,8 @@ def main() -> int:
 
     try:
         records = _load_recent(_WINDOW_DAYS)
-        report = _format_report(records)
+        outcomes = _gather_outcomes(_WINDOW_DAYS)
+        report = _format_report(records, outcomes)
     except Exception as exc:  # noqa: BLE001 - never crash a scheduled job
         logger.exception("Failed to build weekly report")
         try:

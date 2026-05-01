@@ -60,6 +60,7 @@ _client = MarketDataClient()
 
 _last_signal: Optional[str] = None
 _last_signal_time: Optional[datetime] = None
+_last_confidence: Optional[int] = None
 
 
 def run_cycle() -> None:
@@ -68,7 +69,7 @@ def run_cycle() -> None:
     All exceptions are captured and reported to Telegram so that a
     transient failure never tears down the scheduler.
     """
-    global _last_signal, _last_signal_time
+    global _last_signal, _last_signal_time, _last_confidence
 
     cycle_start = datetime.now(timezone.utc).isoformat()
     logger.info("=== Cycle start %s ===", cycle_start)
@@ -91,6 +92,40 @@ def run_cycle() -> None:
         if current_price is None:
             logger.warning("Skipping cycle: current price unavailable")
             return
+
+        # Cross-timeframe sanity check — yfinance occasionally returns
+        # stale or mismatched bars across timeframes for the same
+        # instrument. If the closes diverge by more than 0.5% the
+        # analyst would be reasoning over inconsistent worlds.
+        h1_close = indicators_h1.get("close")
+        d1_close = indicators_d1.get("close")
+        if h1_close is not None and d1_close is not None:
+            max_div = max(abs(h1_close - current_price), abs(d1_close - current_price))
+            if max_div > current_price * 0.005:
+                logger.error(
+                    "Skipping cycle: cross-timeframe mismatch "
+                    "(M15=%.2f H1=%.2f D1=%.2f, max_div=%.2f)",
+                    current_price, h1_close, d1_close, max_div,
+                )
+                return
+
+        # Chop pre-filter — when both H1 and D1 are below the ADX
+        # threshold the market is ranging and trend setups have negative
+        # expectancy. Skip the analyst call entirely to save tokens.
+        if config.CHOP_ADX_THRESHOLD > 0:
+            h1_adx = indicators_h1.get("adx")
+            d1_adx = indicators_d1.get("adx")
+            if (
+                h1_adx is not None
+                and d1_adx is not None
+                and h1_adx < config.CHOP_ADX_THRESHOLD
+                and d1_adx < config.CHOP_ADX_THRESHOLD
+            ):
+                logger.info(
+                    "Skipping cycle: chop regime (H1 ADX=%.1f, D1 ADX=%.1f, threshold=%.1f)",
+                    h1_adx, d1_adx, config.CHOP_ADX_THRESHOLD,
+                )
+                return
 
         dxy_raw = _client.get_dxy_context()
         if dxy_raw is not None:
@@ -120,7 +155,12 @@ def run_cycle() -> None:
                 signal,
                 _last_signal,
                 _last_signal_time,
+                last_confidence=_last_confidence,
                 min_confidence=config.CONFIDENCE_MIN,
+                cooldown_minutes=config.COOLDOWN_MINUTES,
+                confidence_bump=config.DUP_CONFIDENCE_BUMP,
+                session_enabled=config.SESSION_FILTER_ENABLED,
+                min_rr=config.MIN_RR,
             )
 
         delivered = False
@@ -129,6 +169,10 @@ def run_cycle() -> None:
             if delivered:
                 _last_signal = signal["signal"]
                 _last_signal_time = datetime.now(timezone.utc)
+                try:
+                    _last_confidence = int(signal.get("confidence", 0))
+                except (TypeError, ValueError):
+                    _last_confidence = None
 
         log_signal(
             signal,
